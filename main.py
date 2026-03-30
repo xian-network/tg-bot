@@ -154,7 +154,7 @@ class TelegramBot:
         """Load all plugins from the 'plg' folder"""
         try:
             for _, folders, _ in os.walk(con.DIR_PLG):
-                for folder in folders:
+                for folder in sorted(folders):
                     if folder.startswith("_"):
                         continue
                     logger.info(f"Plugin '{folder}' loading...")
@@ -207,12 +207,13 @@ class TelegramBot:
                 await plugin.cleanup()
 
                 # Remove plugin handlers
-                handlers = list(plugin.handlers.items())
-                for group, handler in handlers:
-                    try:
-                        self.bot.remove_handler(handler, group)
-                    except Exception as e:
-                        logger.debug(f"Error removing handler: {e}")
+                handlers_by_group = list(plugin.handlers.items())
+                for group, handlers in handlers_by_group:
+                    for handler in list(handlers):
+                        try:
+                            self.bot.remove_handler(handler, group)
+                        except Exception as e:
+                            logger.debug(f"Error removing handler: {e}")
                 plugin.handlers.clear()
 
                 # Remove plugin endpoints
@@ -225,13 +226,9 @@ class TelegramBot:
                 plugin.endpoints.clear()
 
                 # Remove all plugin references
-                try:
-                    del sys.modules[f"{con.DIR_PLG}.{name}.{name}"]
-                    del sys.modules[f"{con.DIR_PLG}.{name}"]
-                    del self.plugins[name]
-                    del plugin
-                except Exception as e:
-                    logger.debug(f"Error cleaning plugin references: {e}")
+                sys.modules.pop(f"{con.DIR_PLG}.{name}.{name}", None)
+                sys.modules.pop(f"{con.DIR_PLG}.{name}", None)
+                self.plugins.pop(name, None)
 
                 msg = f"Plugin '{name}' disabled"
                 logger.info(msg)
@@ -246,8 +243,9 @@ class TelegramBot:
         module_path = f"{con.DIR_PLG}.{name}.{name}"
 
         def _load() -> ModuleType:
-            module = importlib.import_module(module_path)
-            return importlib.reload(module)
+            if module_path in sys.modules:
+                return importlib.reload(sys.modules[module_path])
+            return importlib.import_module(module_path)
 
         return await asyncio.to_thread(_load)
 

@@ -78,7 +78,7 @@ class TGBFPlugin:
         self._name = type(self).__name__.lower()
 
         # All bot handlers for this plugin
-        self._handlers: Dict[int, BaseHandler] = dict()
+        self._handlers: Dict[int, list[BaseHandler]] = dict()
 
         # All endpoints of this plugin
         self._endpoints: Dict[str, Callable] = dict()
@@ -169,8 +169,8 @@ class TGBFPlugin:
         return self._cfg
 
     @property
-    def handlers(self) -> Dict[int, BaseHandler]:
-        """ Return a list of bot handlers for this plugin """
+    def handlers(self) -> Dict[int, list[BaseHandler]]:
+        """ Return bot handlers grouped by Telegram handler group """
         return self._handlers
 
     @property
@@ -207,17 +207,19 @@ class TGBFPlugin:
                 group = abs(hash(self.name)) % 1000 + 1
 
         self.tgb.bot.add_handler(handler, group)
-        self.handlers[group] = handler
+        self.handlers.setdefault(group, []).append(handler)
 
         self.log.info(f"Plugin '{self.name}': {type(handler).__name__} added to group {group}")
 
     async def remove_handler(self, handler: BaseHandler):
         """ Removed the given handler from the bot """
 
-        for g, h in self.handlers.items():
-            if h == handler:
-                self.tgb.bot.remove_handler(h, g)
-                del self.handlers[g]
+        for group, handlers in list(self.handlers.items()):
+            if handler in handlers:
+                self.tgb.bot.remove_handler(handler, group)
+                handlers.remove(handler)
+                if not handlers:
+                    del self.handlers[group]
                 break
 
         self.log.info(f"Plugin '{self.name}': {type(handler).__name__} removed")
