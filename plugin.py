@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import inspect
 import asyncio
@@ -17,11 +19,13 @@ from xian_py import XianAsync
 from xian_py.wallet import Wallet
 from telegram.constants import ChatAction
 from telegram import Chat, Update, Message
-from typing import Any, BinaryIO, Callable, ClassVar, Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, ClassVar, Dict, Iterable, Optional, Tuple
 from telegram.ext import CallbackContext, BaseHandler, Job, CallbackQueryHandler
 from datetime import datetime, timedelta
 from config import ConfigManager, ConfigError
-from main import TelegramBot
+
+if TYPE_CHECKING:
+    from main import TelegramBot
 
 
 @dataclass(slots=True, frozen=True)
