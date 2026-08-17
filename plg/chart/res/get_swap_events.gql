@@ -1,15 +1,30 @@
-query GetSwapEvents($pairId: String!) {
+query GetSwapEvents(
+    $pairId: String!
+    $createdAfter: Datetime!
+    $first: Int!
+    $after: Cursor
+) {
     allEvents(
+        first: $first
+        after: $after
         condition: {contract: "con_pairs", event: "Swap"}
-        filter: {dataIndexed: {contains: {pair: $pairId}}}
-        orderBy: CREATED_DESC
+        filter: {
+            dataIndexed: {contains: {pair: $pairId}}
+            created: {greaterThanOrEqualTo: $createdAfter}
+        }
+        orderBy: CREATED_ASC
     ) {
         edges {
             node {
+                id
                 dataIndexed
                 data
                 created
             }
+        }
+        pageInfo {
+            hasNextPage
+            endCursor
         }
     }
 }

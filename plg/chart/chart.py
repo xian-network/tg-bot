@@ -178,11 +178,31 @@ class Chart(TGBFPlugin):
 
         return token_symbols
 
-    async def fetch_swap_events_from_graphql(self, pair_id):
-        """Fetch swap events directly from GraphQL, without database interaction"""
+    async def fetch_swap_events_from_graphql(self, pair_id, created_after=None):
+        """Fetch all new swap events from GraphQL using cursor pagination."""
         query = await self.get_resource("get_swap_events.gql")
-        result = await self.fetch_graphql(query, {'pairId': pair_id})
-        return result.get('data', {}).get('allEvents', {}).get('edges', [])
+        created_after = created_after or "1970-01-01T00:00:00Z"
+        after = None
+        events = []
+
+        while True:
+            result = await self.fetch_graphql(query, {
+                "pairId": pair_id,
+                "createdAfter": created_after,
+                "first": 500,
+                "after": after,
+            })
+            connection = result.get("data", {}).get("allEvents", {})
+            events.extend(connection.get("edges", []))
+            page_info = connection.get("pageInfo", {})
+
+            if not page_info.get("hasNextPage"):
+                return events
+
+            next_cursor = page_info.get("endCursor")
+            if not next_cursor or next_cursor == after:
+                raise RuntimeError("GraphQL pagination did not advance")
+            after = next_cursor
 
     async def update_trades_job(self, context: CallbackContext):
         """Background job to update trades for all known pairs"""
@@ -874,23 +894,78 @@ class Chart(TGBFPlugin):
     async def fetch_and_store_new_trades(self, pair_id):
         """Fetch new trades from GraphQL and store them in the database"""
         try:
-            # Get the latest trade timestamp for this pair
-            sql = """
-                  SELECT timestamp \
-                  FROM chart_trades
-                  WHERE pair_id = ?
-                  ORDER BY timestamp DESC
-                  LIMIT 1 \
-                  """
-            result = await self.exec_sql(sql, pair_id)
+            latest_result = await self.exec_sql(
+                """
+                SELECT timestamp
+                FROM chart_trades
+                WHERE pair_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                pair_id,
+            )
+            if not latest_result["success"]:
+                raise RuntimeError(f"Unable to read the latest trade for pair {pair_id}")
 
             last_timestamp = None
-            if result["success"] and result["data"]:
-                last_timestamp_str = result["data"][0][0]
-                last_timestamp = datetime.fromisoformat(last_timestamp_str.replace("Z", "+00:00"))
+            if latest_result["data"]:
+                last_timestamp = datetime.fromisoformat(
+                    latest_result["data"][0][0].replace("Z", "+00:00")
+                )
 
-            # Fetch new trades from GraphQL
-            events = await self.fetch_swap_events_from_graphql(pair_id)
+            # Replaying a bounded window catches events that become visible out
+            # of timestamp order. During the one-time ID migration, replay from
+            # the earliest legacy timestamp so every old row can be reconciled.
+            legacy_min_result = await self.exec_sql(
+                """
+                SELECT MIN(timestamp)
+                FROM chart_trades
+                WHERE id GLOB ?
+                """,
+                f"{pair_id}_*",
+            )
+            if not legacy_min_result["success"]:
+                raise RuntimeError(f"Unable to inspect legacy trades for pair {pair_id}")
+
+            earliest_legacy = None
+            if legacy_min_result["data"] and legacy_min_result["data"][0][0]:
+                earliest_legacy = legacy_min_result["data"][0][0]
+
+            if earliest_legacy:
+                created_after = earliest_legacy
+            elif last_timestamp:
+                created_after = (last_timestamp - timedelta(hours=24)).isoformat()
+            else:
+                created_after = "1970-01-01T00:00:00Z"
+
+            stored_result = await self.exec_sql(
+                """
+                SELECT id, data, timestamp
+                FROM chart_trades
+                WHERE pair_id = ? AND timestamp >= ?
+                """,
+                pair_id,
+                created_after,
+            )
+            if not stored_result["success"]:
+                raise RuntimeError(f"Unable to read stored trades for pair {pair_id}")
+
+            known_trade_ids = set()
+            legacy_trades = []
+            for row in stored_result["data"] or []:
+                stored_id = str(row[0])
+                known_trade_ids.add(stored_id)
+                if stored_id.startswith(f"{pair_id}_"):
+                    legacy_trades.append({
+                        "id": stored_id,
+                        "data": json.loads(row[1]),
+                        "timestamp": datetime.fromisoformat(row[2].replace("Z", "+00:00")),
+                    })
+
+            events = await self.fetch_swap_events_from_graphql(
+                pair_id,
+                created_after=created_after,
+            )
             if not events:
                 return
 
@@ -903,17 +978,44 @@ class Chart(TGBFPlugin):
                 timestamp_str = node["created"]
                 timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
 
-                # Skip if we already have this trade
-                if last_timestamp and timestamp <= last_timestamp:
-                    continue
-
                 # Parse data
                 data = node["data"]
                 if isinstance(data, str):
                     data = json.loads(data)
 
-                # Create trade ID
-                trade_id = f"{pair_id}_{timestamp_str}"
+                if node.get("id") is None:
+                    raise RuntimeError("GraphQL swap event is missing its stable ID")
+                trade_id = str(node["id"])
+                legacy_match = next(
+                    (
+                        trade for trade in legacy_trades
+                        if trade["timestamp"] == timestamp and trade["data"] == data
+                    ),
+                    None,
+                )
+
+                if trade_id in known_trade_ids:
+                    if legacy_match:
+                        delete_result = await self.exec_sql(
+                            "DELETE FROM chart_trades WHERE id = ?",
+                            legacy_match["id"],
+                        )
+                        if delete_result["success"]:
+                            known_trade_ids.discard(legacy_match["id"])
+                            legacy_trades.remove(legacy_match)
+                    continue
+
+                if legacy_match:
+                    update_result = await self.exec_sql(
+                        "UPDATE chart_trades SET id = ? WHERE id = ?",
+                        trade_id,
+                        legacy_match["id"],
+                    )
+                    if update_result["success"]:
+                        known_trade_ids.discard(legacy_match["id"])
+                        known_trade_ids.add(trade_id)
+                        legacy_trades.remove(legacy_match)
+                        continue
 
                 # Save to database
                 sql = """
@@ -929,8 +1031,21 @@ class Chart(TGBFPlugin):
                     json.dumps(data)
                 )
 
-                if result["success"]:
-                    new_trades += 1
+                if not result["success"]:
+                    raise RuntimeError(
+                        f"Unable to store GraphQL event {trade_id} for pair {pair_id}"
+                    )
+
+                known_trade_ids.add(trade_id)
+                new_trades += 1
+                if legacy_match:
+                    delete_result = await self.exec_sql(
+                        "DELETE FROM chart_trades WHERE id = ?",
+                        legacy_match["id"],
+                    )
+                    if delete_result["success"]:
+                        known_trade_ids.discard(legacy_match["id"])
+                        legacy_trades.remove(legacy_match)
 
             if new_trades > 0:
                 self.log.info(f"Added {new_trades} new trades for pair {pair_id}")
