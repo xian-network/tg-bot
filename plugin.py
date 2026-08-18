@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import inspect
 import asyncio
 import aiohttp
@@ -63,6 +64,46 @@ class PluginLifecycleError(RuntimeError):
 
 class PluginDependencyError(PluginLifecycleError):
     """Raised when plugin dependencies are not satisfied."""
+
+
+class GraphQLRequestError(RuntimeError):
+    """A GraphQL failure with enough request context to diagnose it."""
+
+    def __init__(
+            self,
+            *,
+            plugin: str,
+            operation: str,
+            endpoint: str,
+            status: int,
+            errors: list
+    ):
+        self.plugin = plugin
+        self.operation = operation
+        self.endpoint = endpoint
+        self.status = status
+        self.errors = errors
+
+        details = []
+        for error in errors:
+            if not isinstance(error, dict):
+                details.append(str(error))
+                continue
+
+            detail = str(error.get("message", error))
+            path = error.get("path")
+            extensions = error.get("extensions")
+            code = extensions.get("code") if isinstance(extensions, dict) else None
+            if path:
+                detail += f" (path={'.'.join(str(part) for part in path)})"
+            if code:
+                detail += f" (code={code})"
+            details.append(detail)
+
+        context = (
+            f"plugin={plugin} operation={operation} endpoint={endpoint} status={status}"
+        )
+        super().__init__(f"GraphQL request failed [{context}]: {'; '.join(details)}")
 
 
 class TGBFPlugin:
@@ -415,6 +456,11 @@ class TGBFPlugin:
         """
         variables = variables or {}
         endpoint = endpoint or self.cfg_global.get('xian', 'graph_ql')
+        operation_match = re.search(
+            r"\b(?:query|mutation|subscription)\s+([_A-Za-z][_0-9A-Za-z]*)",
+            query
+        )
+        operation = operation_match.group(1) if operation_match else "anonymous"
 
         # Prepare default headers
         default_headers = {'Content-Type': 'application/json'}
@@ -436,13 +482,24 @@ class TGBFPlugin:
                 ) as response:
                     result = await response.json()
 
-                    # Check for HTTP error status
-                    if response.status != 200:
-                        raise Exception(f"GraphQL query failed with status code {response.status}")
+                    errors = result.get('errors')
+                    if errors:
+                        raise GraphQLRequestError(
+                            plugin=self.name,
+                            operation=operation,
+                            endpoint=endpoint,
+                            status=response.status,
+                            errors=errors if isinstance(errors, list) else [errors]
+                        )
 
-                    # Check for GraphQL errors
-                    if 'errors' in result:
-                        raise Exception(f"GraphQL query returned errors")
+                    if response.status != 200:
+                        raise GraphQLRequestError(
+                            plugin=self.name,
+                            operation=operation,
+                            endpoint=endpoint,
+                            status=response.status,
+                            errors=[{"message": f"HTTP status {response.status}"}]
+                        )
 
                     return result
 

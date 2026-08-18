@@ -331,10 +331,29 @@ class Price(TGBFPlugin):
         return None
 
     async def fetch_swap_events(self, pair_id):
-        """Fetch swap events for a specific pair"""
+        """Fetch all swap events for a specific pair."""
         query = await self.get_resource("get_swap_events.gql", plugin="chart")
-        result = await self.fetch_graphql(query, {'pairId': pair_id})
-        return result.get('data', {}).get('allEvents', {}).get('edges', [])
+        after = None
+        events = []
+
+        while True:
+            result = await self.fetch_graphql(query, {
+                "pairId": pair_id,
+                "createdAfter": "1970-01-01T00:00:00Z",
+                "first": 500,
+                "after": after,
+            })
+            connection = result.get("data", {}).get("allEvents", {})
+            events.extend(connection.get("edges", []))
+            page_info = connection.get("pageInfo", {})
+
+            if not page_info.get("hasNextPage"):
+                return events
+
+            next_cursor = page_info.get("endCursor")
+            if not next_cursor or next_cursor == after:
+                raise RuntimeError("GraphQL pagination did not advance")
+            after = next_cursor
 
     def process_swap_events(self, events, interval_minutes, limit, base_is_token0=True):
         """Convert swap events to candlestick data for price calculation"""
