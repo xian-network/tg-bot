@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 import inspect
 import asyncio
+import traceback
 import aiohttp
 import pickledb
 import aiosqlite
@@ -15,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from loguru import logger
 from functools import wraps
+from time import monotonic
 from pickledb import PickleDB
 from xian_py import XianAsync
 from xian_py.wallet import Wallet
@@ -23,10 +26,46 @@ from telegram import Chat, Update, Message
 from typing import TYPE_CHECKING, Any, BinaryIO, Callable, ClassVar, Dict, Iterable, Optional, Tuple
 from telegram.ext import CallbackContext, BaseHandler, Job, CallbackQueryHandler
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 from config import ConfigManager, ConfigError
 
 if TYPE_CHECKING:
     from main import TelegramBot
+
+
+def _redact_url_for_log(url: str) -> str:
+    """Return an endpoint URL without userinfo, query parameters, or fragments."""
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        if not parsed.scheme or not hostname:
+            return "<invalid-endpoint>"
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        netloc = f"{hostname}:{parsed.port}" if parsed.port else hostname
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return "<invalid-endpoint>"
+
+
+def _graphql_operation(query: str) -> tuple[str, str]:
+    """Conservatively identify the first operation after leading comments."""
+    remaining = query
+    while True:
+        remaining = remaining.lstrip()
+        if not remaining.startswith("#"):
+            break
+        _, separator, remaining = remaining.partition("\n")
+        if not separator:
+            return "anonymous", "anonymous"
+
+    operation_match = re.match(
+        r"(query|mutation|subscription)\s+([_A-Za-z][_0-9A-Za-z]*)\b",
+        remaining,
+    )
+    if not operation_match:
+        return "anonymous", "anonymous"
+    return operation_match.group(1), operation_match.group(2)
 
 
 @dataclass(slots=True, frozen=True)
@@ -75,7 +114,7 @@ class GraphQLRequestError(RuntimeError):
             plugin: str,
             operation: str,
             endpoint: str,
-            status: int,
+            status: Optional[int],
             errors: list
     ):
         self.plugin = plugin
@@ -101,13 +140,16 @@ class GraphQLRequestError(RuntimeError):
             details.append(detail)
 
         context = (
-            f"plugin={plugin} operation={operation} endpoint={endpoint} status={status}"
+            f"plugin={plugin} operation={operation} "
+            f"endpoint={_redact_url_for_log(endpoint)} status={status}"
         )
         super().__init__(f"GraphQL request failed [{context}]: {'; '.join(details)}")
 
 
 class TGBFPlugin:
     log = logger
+    NOTIFY_COOLDOWN_SECONDS: ClassVar[float] = 3600.0
+    MAX_NOTIFY_FINGERPRINTS: ClassVar[int] = 256
     MANIFEST: ClassVar[Optional[PluginManifest]] = None
     requires: ClassVar[Tuple[str, ...]] = tuple()
 
@@ -436,7 +478,9 @@ class TGBFPlugin:
             variables: dict = None,
             endpoint: str = None,
             headers: dict = None,
-            timeout: float = 30.0
+            timeout: float = 10.0,
+            max_attempts: int = 3,
+            retry_delay: float = 0.5
     ) -> dict:
         """
         Execute a GraphQL query and return the results.
@@ -446,7 +490,9 @@ class TGBFPlugin:
             variables: Optional variables for the query
             endpoint: GraphQL endpoint URL (falls back to config if not provided)
             headers: Optional additional headers
-            timeout: Request timeout in seconds
+            timeout: Per-attempt request timeout in seconds
+            max_attempts: Attempts for idempotent queries after transport timeouts
+            retry_delay: Initial delay between query attempts in seconds
 
         Returns:
             Dict containing the GraphQL response
@@ -456,11 +502,9 @@ class TGBFPlugin:
         """
         variables = variables or {}
         endpoint = endpoint or self.cfg_global.get('xian', 'graph_ql')
-        operation_match = re.search(
-            r"\b(?:query|mutation|subscription)\s+([_A-Za-z][_0-9A-Za-z]*)",
-            query
-        )
-        operation = operation_match.group(1) if operation_match else "anonymous"
+        operation_type, operation = _graphql_operation(query)
+        attempts = max(1, int(max_attempts)) if operation_type == "query" else 1
+        log_endpoint = _redact_url_for_log(endpoint)
 
         # Prepare default headers
         default_headers = {'Content-Type': 'application/json'}
@@ -474,38 +518,79 @@ class TGBFPlugin:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                        endpoint,
-                        json=payload,
-                        headers=default_headers,
-                        timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as response:
-                    result = await response.json()
+                for attempt in range(1, attempts + 1):
+                    try:
+                        async with session.post(
+                                endpoint,
+                                json=payload,
+                                headers=default_headers,
+                                timeout=aiohttp.ClientTimeout(total=timeout)
+                        ) as response:
+                            result = await response.json()
 
-                    errors = result.get('errors')
-                    if errors:
-                        raise GraphQLRequestError(
+                            errors = result.get('errors')
+                            if errors:
+                                raise GraphQLRequestError(
+                                    plugin=self.name,
+                                    operation=operation,
+                                    endpoint=endpoint,
+                                    status=response.status,
+                                    errors=errors if isinstance(errors, list) else [errors]
+                                )
+
+                            if response.status != 200:
+                                raise GraphQLRequestError(
+                                    plugin=self.name,
+                                    operation=operation,
+                                    endpoint=endpoint,
+                                    status=response.status,
+                                    errors=[{"message": f"HTTP status {response.status}"}]
+                                )
+
+                            return result
+                    except asyncio.TimeoutError as exc:
+                        if attempt < attempts:
+                            delay = max(0.0, retry_delay) * (2 ** (attempt - 1))
+                            self.log.warning(
+                                f"GraphQL query timeout [plugin={self.name} "
+                                f"operation={operation} endpoint={log_endpoint} "
+                                f"attempt={attempt}/{attempts} timeout={timeout}s]; "
+                                f"retrying in {delay}s"
+                            )
+                            if delay:
+                                await asyncio.sleep(delay)
+                            continue
+
+                        error = GraphQLRequestError(
                             plugin=self.name,
                             operation=operation,
                             endpoint=endpoint,
-                            status=response.status,
-                            errors=errors if isinstance(errors, list) else [errors]
+                            status=None,
+                            errors=[{
+                                "message": (
+                                    f"request timed out after {timeout}s "
+                                    f"on {attempts} attempt{'s' if attempts != 1 else ''}"
+                                )
+                            }],
                         )
+                        self.log.error(str(error))
+                        raise error from exc
 
-                    if response.status != 200:
-                        raise GraphQLRequestError(
-                            plugin=self.name,
-                            operation=operation,
-                            endpoint=endpoint,
-                            status=response.status,
-                            errors=[{"message": f"HTTP status {response.status}"}]
-                        )
-
-                    return result
-
-        except Exception as e:
-            self.log.error(f"GraphQL error: {e}")
+                raise RuntimeError("GraphQL request attempts exhausted")
+        except GraphQLRequestError:
             raise
+        except Exception as exc:
+            error = GraphQLRequestError(
+                plugin=self.name,
+                operation=operation,
+                endpoint=endpoint,
+                status=getattr(exc, "status", None),
+                errors=[{
+                    "message": f"request/response failure ({type(exc).__name__})"
+                }],
+            )
+            self.log.error(str(error))
+            raise error from exc
 
     async def exec_sql_global(self, sql, *args, db_name=""):
         """ Execute raw SQL statement on the global
@@ -703,22 +788,97 @@ class TGBFPlugin:
                 datetime.utcnow() + timedelta(seconds=after_secs),
                 data=f"{message.chat_id}_{message.message_id}")
 
-    async def notify(self, msg: str | Exception) -> bool:
-        """ Admin in global config will get a message with the given text.
-         Primarily used for exceptions but can be used with other inputs too. """
-
-        msg = repr(msg) if isinstance(msg, Exception) else msg
-
+    async def _send_admin_alert(self, msg: str) -> bool:
         admin = self.cfg_global.get('admin_tg_id')
-
         try:
             await self.tgb.bot.updater.bot.send_message(admin, f"{c.ALERT} {msg}")
-        except Exception as e:
-            error = f"Not possible to notify admin id '{admin}'"
-            self.log.error(f"{error}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log.error(f"Not possible to notify admin id '{admin}': {exc}")
             return False
-
         return True
+
+    async def notify(self, msg: str | Exception) -> bool:
+        """Notify the admin, rate-limiting identical exception alerts."""
+        if not isinstance(msg, Exception):
+            return await self._send_admin_alert(msg)
+
+        frames = traceback.extract_tb(msg.__traceback__)
+        origin = frames[-1] if frames else None
+        origin_text = (
+            f"{Path(origin.filename).name}:{origin.lineno} in {origin.name}"
+            if origin else "unavailable"
+        )
+        exception_type = type(msg).__name__
+        detail = str(msg).strip() or "<no message>"
+        alert_message = (
+            f"plugin={self.name} exception={exception_type}: {detail} "
+            f"origin={origin_text}"
+        )
+        alert_key = hashlib.sha256(alert_message.encode("utf-8")).hexdigest()
+
+        notification_lock = getattr(self, "_notification_lock", None)
+        if notification_lock is None:
+            notification_lock = asyncio.Lock()
+            self._notification_lock = notification_lock
+
+        async with notification_lock:
+            now = monotonic()
+            notification_state = getattr(self, "_notification_state", None)
+            if notification_state is None:
+                notification_state = {}
+                self._notification_state = notification_state
+
+            previous_alert = notification_state.get(alert_key)
+            if (
+                    previous_alert
+                    and now - previous_alert["last_sent"] < self.NOTIFY_COOLDOWN_SECONDS
+            ):
+                previous_alert["suppressed"] += 1
+                self.log.warning(
+                    f"Suppressed duplicate admin alert [plugin={self.name} "
+                    f"exception={exception_type} origin={origin_text} "
+                    f"fingerprint={alert_key[:12]} "
+                    f"count={previous_alert['suppressed']}]"
+                )
+                return True
+
+            suppressed = previous_alert["suppressed"] if previous_alert else 0
+            if suppressed:
+                alert_message += (
+                    f" (suppressed {suppressed} similar "
+                    f"alert{'s' if suppressed != 1 else ''})"
+                )
+
+            evicted_alert = None
+            if alert_key not in notification_state and len(notification_state) >= self.MAX_NOTIFY_FINGERPRINTS:
+                oldest_key = min(
+                    notification_state,
+                    key=lambda key: notification_state[key]["last_sent"],
+                )
+                evicted_alert = (oldest_key, notification_state.pop(oldest_key))
+
+            notification_state[alert_key] = {"last_sent": now, "suppressed": 0}
+            cancelled_error = None
+            try:
+                sent = await self._send_admin_alert(alert_message)
+            except asyncio.CancelledError as exc:
+                sent = None
+                cancelled_error = exc
+
+            if sent is not True:
+                if previous_alert is None:
+                    notification_state.pop(alert_key, None)
+                else:
+                    notification_state[alert_key] = previous_alert
+                if evicted_alert is not None:
+                    notification_state[evicted_alert[0]] = evicted_alert[1]
+                if cancelled_error is not None:
+                    raise cancelled_error
+                return False
+
+            return True
 
     @classmethod
     def logging(cls):
